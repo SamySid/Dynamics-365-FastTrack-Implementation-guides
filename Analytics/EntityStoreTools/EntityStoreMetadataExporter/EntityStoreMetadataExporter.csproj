@@ -8,7 +8,7 @@
   </PropertyGroup>
 
   <PropertyGroup>
-    <AOSBinPath Condition="'$(AOSBinPath)' == '' ">C:\AosService\PackagesLocalDirectory\bin</AOSBinPath>
+    <AOSBinPath Condition="'$(AOSBinPath)' == '' ">K:\AosService\PackagesLocalDirectory\bin</AOSBinPath>
     <AssemblyName>EntityStoreMetadataExporter</AssemblyName>
   </PropertyGroup>
 
