@@ -1,51 +1,95 @@
---Truncation of Transactional Tables
-DECLARE @TableName NVARCHAR(255)
+DECLARE @TableName NVARCHAR(255) = 'InventTrans'
 DECLARE @SQL NVARCHAR(MAX)
 DECLARE @ErrorMessage NVARCHAR(4000)
 DECLARE @CDCState BIT
+DECLARE @SimulationMode BIT = 1 -- Set to 1 for simulation mode, 0 for actual execution
+DECLARE @ArchiveDate DATE = DATEADD(YEAR, -1, GETDATE()) -- Archive date is one year before today
+DECLARE @CalendarRecId BIGINT;
+DECLARE @FiscalPeriodStatus NVARCHAR(50);
 
--- Cursor to loop through the table names
-DECLARE TableCursor CURSOR FOR
-SELECT SQLNAME
-FROM SQLDICTIONARY a
-JOIN TABLEMETADATATABLE b ON a.TABLEID = b.TABLEID
--- Transaction (4),WorksheetHeader (5),WorksheetLine (6),Worksheet (9),TransactionHeader (10),TransactionLine (11),Staging (12)
-WHERE a.fieldid = 0 AND a.array = 0 AND b.TABLEGROUP IN (4, 5, 6, 9, 10, 11, 12)
-OPEN TableCursor
-FETCH NEXT FROM TableCursor INTO @TableName
-WHILE @@FETCH_STATUS = 0
+-- Get the fiscal calendar RecId for the company
+SELECT @CalendarRecId = Ledger.FiscalCalendar
+FROM CompanyInfo
+JOIN Ledger ON CompanyInfo.RecId = Ledger.CompanyInfoRecId;
+
+-- Find the fiscal calendar period by calendar date
+DECLARE @FiscalCalendarPeriod TABLE (
+    FiscalPeriodStatus NVARCHAR(50)
+);
+
+INSERT INTO @FiscalCalendarPeriod (FiscalPeriodStatus)
+SELECT FiscalCalendarPeriod.Status
+FROM FiscalCalendarPeriod
+WHERE FiscalCalendarPeriod.CalendarRecId = @CalendarRecId
+AND FiscalCalendarPeriod.StartDate <= @ArchiveDate
+AND FiscalCalendarPeriod.EndDate >= @ArchiveDate
+AND FiscalCalendarPeriod.PeriodType = 'Operating';
+
+-- Check if the ledger period is closed
+IF NOT EXISTS (SELECT 1 FROM @FiscalCalendarPeriod)
 BEGIN
-    BEGIN TRY
-        BEGIN TRANSACTION
-        -- Check if CDC is enabled for the table
-        SELECT @CDCState = is_tracked_by_cdc
-        FROM sys.tables
-        WHERE name = @TableName AND schema_id = SCHEMA_ID('dbo')
-        -- Disable CDC if it is enabled
-        IF @CDCState = 1
-        BEGIN
-            SET @SQL = 'EXEC sys.sp_cdc_disable_table @source_schema = N''dbo'', @source_name = N''' + @TableName + ''', @capture_instance = N''dbo_' + @TableName + ''''
-            EXEC sp_executesql @SQL
-        END
-        -- Truncate the table
-        SET @SQL = 'TRUNCATE TABLE ' + @TableName
-        EXEC sp_executesql @SQL
-        PRINT 'Successfully truncated table: ' + @TableName
-        -- Re-enable CDC if it was previously enabled
-        IF @CDCState = 1
-        BEGIN
-            SET @SQL = 'EXEC sys.sp_cdc_enable_table @source_schema = N''dbo'', @source_name = N''' + @TableName + ''', @role_name = NULL'
-            EXEC sp_executesql @SQL
-        END
-        COMMIT TRANSACTION
-    END TRY
-    BEGIN CATCH
-        ROLLBACK TRANSACTION
-        SET @ErrorMessage = ERROR_MESSAGE()
-        PRINT 'Error truncating table ' + @TableName + '. Error: ' + @ErrorMessage
-    END CATCH
-FETCH NEXT FROM TableCursor INTO @TableName
+    PRINT 'The archive date ' + CONVERT(NVARCHAR, @ArchiveDate, 101) + ' is not within a valid fiscal period.';
+    RETURN;
 END
-CLOSE TableCursor
-DEALLOCATE TableCursor
- 
+
+-- Check if the fiscal period is open
+SELECT @FiscalPeriodStatus = FiscalPeriodStatus FROM @FiscalCalendarPeriod;
+
+IF @FiscalPeriodStatus != 'Open'
+BEGIN
+    PRINT 'The fiscal period for the archive date ' + CONVERT(NVARCHAR, @ArchiveDate, 101) + ' is not open.';
+    RETURN;
+END
+
+-- Check if inventory closing is completed
+IF EXISTS (SELECT 1 FROM InventClosing WHERE ClosingDate <= @ArchiveDate)
+BEGIN
+    -- Check if there are no existing inventory recalculations
+    IF NOT EXISTS (SELECT 1 FROM InventRecalculation WHERE RecalculationDate > @ArchiveDate)
+    BEGIN
+        IF @SimulationMode = 1
+        BEGIN
+            PRINT 'Records to be deleted from table: ' + @TableName
+        END
+        ELSE
+        BEGIN
+            BEGIN TRY
+                BEGIN TRANSACTION
+                -- Check if CDC is enabled for the table
+                SELECT @CDCState = is_tracked_by_cdc
+                FROM sys.tables
+                WHERE name = @TableName AND schema_id = SCHEMA_ID('dbo')
+                -- Disable CDC if it is enabled
+                IF @CDCState = 1
+                BEGIN
+                    SET @SQL = 'EXEC sys.sp_cdc_disable_table @source_schema = N''dbo'', @source_name = N''' + @TableName + ''', @capture_instance = N''dbo_' + @TableName + ''''
+                    EXEC sp_executesql @SQL
+                END
+                -- Delete records from the table
+                SET @SQL = 'DELETE FROM ' + @TableName + ' WHERE TransDate <= @ArchiveDate'
+                EXEC sp_executesql @SQL, N'@ArchiveDate DATE', @ArchiveDate
+                PRINT 'Successfully deleted records from table: ' + @TableName
+                -- Re-enable CDC if it was previously enabled
+                IF @CDCState = 1
+                BEGIN
+                    SET @SQL = 'EXEC sys.sp_cdc_enable_table @source_schema = N''dbo'', @source_name = N''' + @TableName + ''', @role_name = NULL'
+                    EXEC sp_executesql @SQL
+                END
+                COMMIT TRANSACTION
+            END TRY
+            BEGIN CATCH
+                ROLLBACK TRANSACTION
+                SET @ErrorMessage = ERROR_MESSAGE()
+                PRINT 'Error deleting records from table ' + @TableName + '. Error: ' + @ErrorMessage
+            END CATCH
+        END
+    END
+    ELSE
+    BEGIN
+        PRINT 'Inventory recalculations exist after the archive date. Cannot proceed with deletion.'
+    END
+END
+ELSE
+BEGIN
+    PRINT 'Inventory closing is not completed for the period of the archive dates. Cannot proceed with deletion.'
+END
